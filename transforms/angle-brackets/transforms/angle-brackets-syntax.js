@@ -1,5 +1,6 @@
 const glimmer = require('@glimmer/syntax');
 const prettier = require("prettier");
+const { parse } = require("ember-template-recast");
 const path = require('path');
 const fs = require('fs');
 
@@ -210,148 +211,145 @@ const transformNestedSubExpression = subExpression => {
  * @param options
  * @returns {undefined}
  */
-module.exports = function(fileInfo, api, options) {
-  const ast = glimmer.preprocess(fileInfo.source);
-  const b = glimmer.builders;
-  const config = new Config(options);
+module.exports = function({ source, path }, { parse, visit }) {
+  const ast = parse(source);
+  return visit(ast, env => {
+    let { builders: b } = env.syntax;
 
-  /**
-   * Transform the attributes names & values properly 
-   */
-  const transformAttrs = attrs => {
+    /**
+     * Transform the attributes names & values properly 
+     */
+    const transformAttrs = attrs => {
 
-    return attrs.map(a => {
-      let _key = a.key;
-      let _valueType = a.value.type;
-      let _value;
-      if (!isAttribute(a.key)) {
-        _key = "@" + _key;
-      }
-
-      if (_valueType === "PathExpression") {
-        _value = b.mustache(b.path(a.value.original));
-      } else if (_valueType === "SubExpression") {
-        if (a.value.hash.pairs.length > 0) {
-          _value = b.mustache(a.value.path.original, a.value.params, a.value.hash)
-        } else {
-          const params = a.value.params.map(p => {
-            if(p.type === "SubExpression") {
-              return transformNestedSubExpression(p)
-            } else if(p.type === "StringLiteral") {
-              return  `"${p.original}"` ;
-            } else {
-              return p.original
-            }
-          }).join(" ");
-
-          _value = b.mustache(b.path(a.value.path.original + " " + params));
+      return attrs.map(a => {
+        let _key = a.key;
+        let _valueType = a.value.type;
+        let _value;
+        if (!isAttribute(a.key)) {
+          _key = "@" + _key;
         }
 
-      } else if(_valueType === "BooleanLiteral") {
-       _value = b.mustache(b.boolean(a.value.original))
-      } else {
-        _value = b.text(a.value.original);
+        if (_valueType === "PathExpression") {
+          _value = b.mustache(b.path(a.value.original));
+        } else if (_valueType === "SubExpression") {
+          if (a.value.hash.pairs.length > 0) {
+            _value = b.mustache(a.value.path.original, a.value.params, a.value.hash)
+          } else {
+            const params = a.value.params.map(p => {
+              if(p.type === "SubExpression") {
+                return transformNestedSubExpression(p)
+              } else if(p.type === "StringLiteral") {
+                return  `"${p.original}"` ;
+              } else {
+                return p.original
+              }
+            }).join(" ");
+
+            _value = b.mustache(b.path(a.value.path.original + " " + params));
+          }
+
+        } else if(_valueType === "BooleanLiteral") {
+        _value = b.mustache(b.boolean(a.value.original))
+        } else {
+          _value = b.text(a.value.original);
+        }
+
+        return b.attr(_key, _value);
+      });
+    };
+
+    const transformLinkToAttrs = params => {
+      let attributes = [];
+
+      if (params.length === 1) {
+        // @route param
+        attributes = [b.attr("@route", b.text(params[0].value))];
+      } else if (params.length === 2) {
+        // @route and @model param
+        let [route, model] = params;
+        let _routeParam = b.attr("@route", b.text(route.value));
+
+        if (model.type === "SubExpression") {
+          let _queryParam = b.attr("@query", b.mustache(b.path("hash"), [], model.hash));
+          attributes = [_routeParam, _queryParam];
+        } else {
+          let _modelParam = b.attr("@model", b.mustache(model.original));
+          attributes = [_routeParam, _modelParam];
+        }
+      } else if (params.length > 2) {
+        // @route and @models params
+        let [route, ...models] = params;
+        let _routeParam = b.attr("@route", b.text(route.value));
+        let _modelsParam = b.attr("@models", b.mustache(b.path("array"), models));
+        attributes = [_routeParam, _modelsParam];
       }
 
-      return b.attr(_key, _value);
-    });
-  };
+      return attributes;
+    };
 
-  const transformLinkToAttrs = params => {
-    let attributes = [];
+    const tranformValuelessDataParams = params => {
+      let valuelessDataParams = params.filter(param => param.original.startsWith('data-'));
+      let valuelessDataAttributes = valuelessDataParams.map(param => b.attr(param.parts[0], b.mustache("true")));
+      return valuelessDataAttributes;
+    };
 
-    if (params.length === 1) {
-      // @route param
-      attributes = [b.attr("@route", b.text(params[0].value))];
-    } else if (params.length === 2) {
-      // @route and @model param
-      let [route, model] = params;
-      let _routeParam = b.attr("@route", b.text(route.value));
+    const transformNodeAttributes = node => {
+      let params = tranformValuelessDataParams(node.params);
+      let attributes = transformAttrs(node.hash.pairs);
 
-      if (model.type === "SubExpression") {
-        let _queryParam = b.attr("@query", b.mustache(b.path("hash"), [], model.hash));
-        attributes = [_routeParam, _queryParam];
-      } else {
-        let _modelParam = b.attr("@model", b.mustache(model.original));
-        attributes = [_routeParam, _modelParam];
-      }
-    } else if (params.length > 2) {
-      // @route and @models params
-      let [route, ...models] = params;
-      let _routeParam = b.attr("@route", b.text(route.value));
-      let _modelsParam = b.attr("@models", b.mustache(b.path("array"), models));
-      attributes = [_routeParam, _modelsParam];
+      return params.concat(attributes);
     }
 
-    return attributes;
-  };
+    const shouldIgnoreMustacheStatement = (name) => {
+      return IGNORE_MUSTACHE_STATEMENTS.includes(name) || config.helpers.includes(name);
+    }
 
-  const tranformValuelessDataParams = params => {
-    let valuelessDataParams = params.filter(param => param.original.startsWith('data-'));
-    let valuelessDataAttributes = valuelessDataParams.map(param => b.attr(param.parts[0], b.mustache("true")));
-    return valuelessDataAttributes;
-  };
+    const transformNode = node => {
+      const tagName = node.path.original;
+      const newTagName = transformTagName(tagName);
 
-  const transformNodeAttributes = node => {
-    let params = tranformValuelessDataParams(node.params);
-    let attributes = transformAttrs(node.hash.pairs);
+      let attributes;
+      let children = node.program ? node.program.body : undefined;
+      let blockParams = node.program ? node.program.blockParams : undefined;
 
-    return params.concat(attributes);
-  }
+      if(tagName === 'link-to') {
+        if (node.type === 'MustacheStatement') {
+          let params = node.params;
+          let textParam = params.shift(); //the first param becomes the block content
 
-  const shouldIgnoreMustacheStatement = (name) => {
-    return IGNORE_MUSTACHE_STATEMENTS.includes(name) || config.helpers.includes(name);
-  }
+          attributes = transformLinkToAttrs(params);
+          children = [b.text(textParam.value)];
+        } else {
+          attributes = transformLinkToAttrs(node.params);
+        }
 
-  const transformNode = node => {
-    const tagName = node.path.original;
-    const newTagName = transformTagName(tagName);
-
-    let attributes;
-    let children = node.program ? node.program.body : undefined;
-    let blockParams = node.program ? node.program.blockParams : undefined;
-
-    if(tagName === 'link-to') {
-      if (node.type === 'MustacheStatement') {
-        let params = node.params;
-        let textParam = params.shift(); //the first param becomes the block content
-
-        attributes = transformLinkToAttrs(params);
-        children = [b.text(textParam.value)];
+        let namesParams = transformAttrs(node.hash.pairs);
+        attributes = attributes.concat(namesParams);
       } else {
-        attributes = transformLinkToAttrs(node.params);
+        attributes = transformNodeAttributes(node);
       }
 
-      let namesParams = transformAttrs(node.hash.pairs);
-      attributes = attributes.concat(namesParams);
-    } else {
-      attributes = transformNodeAttributes(node);
+      return b.element(newTagName, {
+        attrs: attributes,
+        children,
+        blockParams
+      });
     }
 
-    return b.element(newTagName, {
-      attrs: attributes,
-      children,
-      blockParams
-    });
-  }
+    return {
+      MustacheStatement(node) {
+        // Don't change attribute statements
+        const isValidMustache = node.loc.source !== "(synthetic)" && !shouldIgnoreMustacheStatement(node.path.original);
+        if (isValidMustache && (node.hash.pairs.length > 0 || node.params.length > 0)) {
+          return transformNode(node);
+        }
+      },
 
-  glimmer.traverse(ast, {
-    MustacheStatement(node) {
-      // Don't change attribute statements
-      const isValidMustache = node.loc.source !== "(synthetic)" && !shouldIgnoreMustacheStatement(node.path.original);
-      if (isValidMustache && (node.hash.pairs.length > 0 || node.params.length > 0)) {
-        return transformNode(node);
+      BlockStatement(node) {
+        if (!shouldIgnoreMustacheStatement(node.path.original)) {
+          return transformNode(node);
+        }
       }
-    },
-
-    BlockStatement(node) {
-      if (!shouldIgnoreMustacheStatement(node.path.original)) {
-        return transformNode(node);
-      }
-    }
-
+    };
   });
-
-  let uglySource = glimmer.print(ast);
-  return prettier.format(uglySource, { parser: "glimmer" });
 };
